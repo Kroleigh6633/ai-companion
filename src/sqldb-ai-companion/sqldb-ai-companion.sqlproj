@@ -1,0 +1,10 @@
+<Project Sdk="MSBuild.Sdk.SqlProj/2.6.0">
+  <PropertyGroup>
+    <!-- SQL Server 2022 (Sql160). Upgrade to Sql170 when MSBuild.Sdk.SqlProj supports SQL 2025. -->
+    <SqlServerVersion>Sql160</SqlServerVersion>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <!-- Database name enforces naming convention from ADR-0001 -->
+    <DatabaseName>sqldb-pas-main-dev</DatabaseName>
+  </PropertyGroup>
+</Project>

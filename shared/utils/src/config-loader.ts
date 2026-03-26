@@ -1,11 +1,20 @@
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 
+export interface PortRegistry {
+  mcpShell:      number;   // 8180
+  companionApi:  number;   // 8181
+  companionApi2: number;   // 8182
+  [key: string]: number;   // extensible for future services
+}
+
 export interface McpConfig {
-  neo4j: { url: string; user: string; password: string };
+  ports:     PortRegistry;
+  neo4j:     { url: string; user: string; password: string };
+  sqlServer: { server: string; database: string; user: string; password: string };
   apiServer: { baseUrl: string };
-  ollama: { baseUrl: string };
-  github: { token: string };
+  ollama:    { baseUrl: string };
+  github:    { token: string };
   fileStore: { basePath: string };
 }
 
