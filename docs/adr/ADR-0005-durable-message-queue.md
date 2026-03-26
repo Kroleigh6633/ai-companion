@@ -8,17 +8,15 @@
 
 ## Context
 
-The MCP shell hosts an in-process EventEmitter for session-lifetime events (e.g., a document
-is created → embeddings server embeds it immediately). But session-lifetime events are lost
-when Claude Code closes. Background work that hasn't been processed yet — unembedded chunks,
-pending graph re-indexes, unprocessed validation results — needs to survive session restarts.
+The MCP shell hosts an in-process EventEmitter for session-lifetime events (fast path).
+Events that need to survive session restarts — unembedded chunks, pending re-indexes,
+unprocessed validation results — require a durable queue.
 
 Requirements:
 - No Redis, no RabbitMQ, no additional infrastructure
-- Works with existing file share (`\\MJHRGB01\file-system\`) and SQL Server
-- Survives session restarts (durable)
-- Configurable polling interval (not push-based)
-- Simple enough to implement and operate
+- Survives session restarts
+- Configurable polling interval
+- Simple to operate
 
 ---
 
@@ -33,103 +31,103 @@ import { EventEmitter } from 'node:events';
 export const bus = new EventEmitter();
 ```
 
-Used for: immediate reactions within the same session (document created → embed now).
-Lost on session end. That's acceptable — the slow path handles durability.
+Immediate reactions within the same session. Lost on session end — that's acceptable,
+the slow path handles anything that must survive.
 
-### Tier 2 — File-share queue (slow path, durable)
+### Tier 2 — SQL Server Service Broker (slow path, durable)
 
-Events that need durability are written as files to the queue directory:
+Service Broker is built into SQL Server (no additional infrastructure). It provides
+transactional, ordered, at-least-once delivery backed by the same database we already use.
+
+**SQL Server 2025 improvements make this the right choice:**
+
+| Feature | Benefit |
+|---------|---------|
+| `message_enqueue_time` column | Built-in queue depth and latency monitoring |
+| `POISON_MESSAGE_HANDLING (STATUS = ON)` | Automatic dead-lettering after repeated failures — no custom retry counter needed |
+
+### Architecture
 
 ```
-\\MJHRGB01\file-system\pas\queue\{event-type}\{id}.json
+TypeScript shell
+  │
+  ├─ poller (every 5s)  →  GET /queue/pending  →  C# Kestrel API
+  │                                                     │
+  └─ enqueue event      →  POST /queue          →  Service Broker SEND
+                                                     │
+                                              SQL Server 2025
+                                          MessageQueue (Service Broker)
+                                                     │
+                                         RECEIVE → C# processes, returns pending list
 ```
 
-Each file is a JSON envelope:
+The TypeScript shell knows nothing about Service Broker. It calls two C# endpoints:
+- `GET /queue/pending?limit=10` — C# does `RECEIVE TOP(10) FROM MessageQueue`
+- `POST /queue/{id}/ack` — C# ends the conversation (commits dequeue)
+- `POST /queue` — C# does `SEND ON CONVERSATION`
 
-```typescript
-interface QueueMessage {
-  id: string;           // UUID — also the filename
-  event: string;        // 'document:created', 'task:ready', etc.
-  payload: unknown;
-  enqueuedAt: string;
-  attempts: number;
-  lastAttemptAt?: string;
+**All Service Broker DDL and logic lives in the C# API.** Hot-reloadable without
+restarting the shell (ADR-0003 principle).
+
+### Payload storage
+
+Message envelopes are in Service Broker (transactional, small).
+Large payloads follow ADR-0002: stored as files on the share, path in the message.
+
+```sql
+-- Message body (JSON, stored by Service Broker)
+{
+  "id": "uuid",
+  "event": "document:created",
+  "payloadPath": "pas/queue/document:created/{id}.json",  -- optional, for large payloads
+  "payload": { ... },  -- inline for small payloads (< ~1KB)
+  "enqueuedAt": "2026-03-26T..."
 }
 ```
 
-**SQL row holds the pointer; file holds the payload** (consistent with ADR-0002):
+### Service Broker DDL (in C# migration)
 
 ```sql
-CREATE TABLE MessageQueue (
-  id          nvarchar(100) NOT NULL PRIMARY KEY,
-  event       nvarchar(100) NOT NULL,
-  payloadPath nvarchar(500) NOT NULL,  -- blob ref: pas/queue/{event}/{id}.json
-  status      nvarchar(20)  NOT NULL DEFAULT 'pending',
-  enqueuedAt  datetime2     NOT NULL DEFAULT GETUTCDATE(),
-  attempts    int           NOT NULL DEFAULT 0,
-  lastAttemptAt datetime2   NULL
-);
-CREATE INDEX IX_Queue_status_event ON MessageQueue(status, event);
+CREATE MESSAGE TYPE [//pas/companion/Event] VALIDATION = NONE;
+CREATE CONTRACT [//pas/companion/EventContract]
+  ([//pas/companion/Event] SENT BY INITIATOR);
+
+CREATE QUEUE CompanionEventQueue
+  WITH POISON_MESSAGE_HANDLING (STATUS = ON);  -- SQL Server 2025
+
+CREATE SERVICE [//pas/companion/EventService]
+  ON QUEUE CompanionEventQueue ([//pas/companion/EventContract]);
 ```
 
-**Poller**: the shell polls on a configurable interval (default 5s). On each tick:
-1. `SELECT TOP 10 * FROM MessageQueue WHERE status = 'pending' ORDER BY enqueuedAt`
-2. For each row: read payload from file share, emit on the in-process bus
-3. On success: `UPDATE status = 'processed'`
-4. On failure: `UPDATE attempts += 1, lastAttemptAt = NOW()`; retry up to 3 times, then `status = 'dead'`
+### Monitoring
 
-### Why not SQL Server Service Broker?
-
-Service Broker is built into SQL Server and provides reliable async messaging with
-transactional delivery guarantees. It is a strong candidate for a future migration.
-We start with the file-share pattern because:
-
-1. Service Broker requires additional DDL (queues, services, contracts, message types)
-2. Our existing infrastructure (file share + SQL pointer from ADR-0002) already handles
-   this pattern well
-3. The polling model is simpler to reason about and debug
-
-**Migration path**: if polling latency or reliability becomes an issue, the `MessageQueue`
-table schema maps cleanly to a Service Broker activation queue. The poller is replaced by
-a Service Broker activation procedure.
-
-### SQL Server 2025 consideration
-
-SQL Server 2025 may introduce native vector + AI pipeline features. This section will be
-updated when the production release is evaluated. The `MessageQueue` table structure is
-intentionally generic — event payloads in files, routing by `event` column — so any future
-SQL-native queuing mechanism can replace the poller without changing the event schema.
+```sql
+-- Queue depth and latency (SQL Server 2025)
+SELECT message_type_name, message_enqueue_time,
+       DATEDIFF(second, message_enqueue_time, GETUTCDATE()) AS age_seconds
+FROM CompanionEventQueue WITH (NOLOCK);
+```
 
 ---
 
-## Implementation
+## What was NOT chosen
 
-- `src/mcp-shell/src/bus.ts` — EventEmitter singleton
-- `src/mcp-shell/src/queue-store.ts` — enqueue / dequeue / ack against SQL + file share
-- `src/mcp-shell/src/poller.ts` — configurable poll loop wired into shell startup
-
-Servers emit durable events via:
-```typescript
-await enqueue('document:created', { id, typeId });
-```
-
-The poller fires:
-```typescript
-bus.emit('document:created', payload);
-```
-
-Handlers are registered by server modules exactly as for session-lifetime events:
-```typescript
-bus.on('document:created', async (payload) => { ... });
-```
+| Option | Reason |
+|--------|--------|
+| Redis | External infrastructure, not on the machine |
+| RabbitMQ | Same |
+| File-share polling (original plan) | Service Broker is already in SQL Server 2025, transactional, and handles poison messages natively — file scanning is redundant |
+| Change Event Streaming (CES, SQL 2025) | Publishes to Azure Event Hubs — external dependency, wrong direction |
+| Service Broker INTERNAL ACTIVATION | Auto-starts T-SQL procedures, not useful for TypeScript/C# callers; the HTTP poll pattern is cleaner |
 
 ---
 
 ## Consequences
 
-- **Good**: Durable events survive session restarts with no new infrastructure
-- **Good**: Consistent with ADR-0002 (SQL pointer + file payload)
-- **Good**: Observable: `MessageQueue` table shows queue depth, failures, dead letters
-- **Good**: Clear migration path to Service Broker if needed
-- **Neutral**: Polling adds ~5s latency for cross-session events (acceptable for background work)
-- **Bad**: Polling under load could be noisy; tune interval and batch size if needed
+- **Good**: Zero new infrastructure — Service Broker is in the SQL Server we already use
+- **Good**: Transactional — enqueue inside a C# transaction means message appears only if the write succeeds
+- **Good**: Poison message handling built into SQL Server 2025 — no custom retry counter
+- **Good**: `message_enqueue_time` gives free monitoring
+- **Good**: Queue logic in C# API — hot-reloadable without shell restart
+- **Neutral**: 5s polling latency for cross-session events (acceptable for background work)
+- **Bad**: Service Broker requires upfront DDL — one migration, paid once
