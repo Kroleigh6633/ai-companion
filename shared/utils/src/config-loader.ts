@@ -2,20 +2,19 @@ import { readFileSync } from 'fs';
 import { resolve } from 'path';
 
 export interface PortRegistry {
-  mcpShell:      number;   // 8180
-  companionApi:  number;   // 8181
-  companionApi2: number;   // 8182
-  [key: string]: number;   // extensible for future services
+  mcpShell:     number;   // 8180
+  companionApi: number;   // 8181
+  [key: string]: number;  // extensible for future services
 }
 
 export interface McpConfig {
   ports:     PortRegistry;
   neo4j:     { url: string; user: string; password: string };
-  sqlServer: { server: string; database: string; user: string; password: string };
+  sqlServer: { server: string; database: string; trustedConnection: boolean };
   apiServer: { baseUrl: string };
   ollama:    { baseUrl: string };
-  github:    { token: string };
   fileStore: { basePath: string };
+  github?:   { token: string };  // optional — only needed when GitHub Issues sync is built
 }
 
 let _config: McpConfig | null = null;
