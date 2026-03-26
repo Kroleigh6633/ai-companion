@@ -193,5 +193,24 @@ CREATE TABLE BlobReferences (
 );
 GO
 
+-- ============================================================
+-- MessageQueue: durable cross-session event queue (ADR-0005)
+-- SQL holds the pointer; file share holds the payload (ADR-0002)
+-- ============================================================
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE name = 'MessageQueue' AND type = 'U')
+CREATE TABLE MessageQueue (
+    id              nvarchar(100)   NOT NULL PRIMARY KEY,
+    event           nvarchar(100)   NOT NULL,
+    payloadPath     nvarchar(500)   NOT NULL,   -- blob ref: pas/queue/{event}/{id}.json
+    status          nvarchar(20)    NOT NULL DEFAULT 'pending',  -- pending|processed|dead
+    enqueuedAt      datetime2       NOT NULL DEFAULT GETUTCDATE(),
+    attempts        int             NOT NULL DEFAULT 0,
+    lastAttemptAt   datetime2       NULL
+);
+GO
+
+CREATE INDEX IF NOT EXISTS IX_Queue_status_event ON MessageQueue(status, event);
+GO
+
 PRINT 'Migration 001 complete: sqldb-pas-main-dev schema created.';
 GO

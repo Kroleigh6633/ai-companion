@@ -7,6 +7,7 @@ import {
 import { ServerRegistry } from './registry.js';
 import { initLoader } from './loader.js';
 import { ToolRouter } from './router.js';
+import { startPoller, stopPoller } from './poller.js';
 import { createLogger } from '@ai-companion/utils';
 
 const log = createLogger('mcp-shell');
@@ -35,6 +36,11 @@ async function main() {
     log.info('Tools updated, notifying client...');
     server.notification({ method: 'notifications/tools/list_changed' }).catch(() => {});
   });
+
+  startPoller();
+
+  process.on('SIGINT', () => { stopPoller(); process.exit(0); });
+  process.on('SIGTERM', () => { stopPoller(); process.exit(0); });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
